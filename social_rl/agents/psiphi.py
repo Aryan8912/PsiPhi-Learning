@@ -218,4 +218,121 @@ def learner_step(
     rng_key: parts.PRNGKey,
 ) -> Tuple[hk.Params, PsiPhiLearnerState, parts.InfoDict]:
     
-    # 309
+    del rng_key
+    assert len(transitions) == 1 + self._cfg.num_demonstrators
+
+    new_target_params = rlax.periodic_update(
+        params, 
+        learner_state.target_params,
+        steps = learner_state.num_unique_steps,
+        update_period = self._cfg.update_target_every)
+    
+    (loss, logging_dict), grads = jax.value_and_grad(
+        self._loss_fn,
+        has_aux=True)(params, learner_state.target_params, transitions)
+    updates, new_opt_state = self._optimizer.update(
+        grads, learner_state.opt_state)
+    logging_dict['global_gradient_norm'] = optax.global_norm(updates)
+
+    new_params = optax.apply_updates(params, updates)
+
+    new_learner_state = learner_state._replace(
+        target_params=new_target_params,
+        opt_state=new_opt_state,
+        num_unique_steps=learner_state.num_unique_steps + 1)
+    
+    return new_params, new_learner_state, dict(loss=loss, **logging_dict)
+
+def _loss_fn(
+        self,
+        params: hk.Params,
+        target_params: hk.Params,
+        transitions: Sequence[parts.Transition],
+) -> parts.LossOutput: 
+    
+    def dqn_network_fn(params: hk.Params, s_tm1: jnp.ndarray) -> jnp.ndarray:
+        return self._network.apply(params, s_tm1).ego_action_value
+    
+    def reward_network_fn(params: hk.Params, s_tm1: jnp.ndarray) -> jnp.ndarray:
+        
+        return self._network.apply(params, s_tm1).ego_reward
+    
+    def bc_network_fn(
+            params: hk.Params,
+            s_tm1: jnp.ndarray,
+            demonstrator_index: int,
+    ) -> jnp.ndarray:
+        policy_logits = self._network.apply(params, s_tm1).others_policy_params
+        chex.assert_rank(policy_logits, 3)
+        return policy_logits[:, demonstrator_index]
+    
+    def itd_network_fn(
+            params: hk.Params,
+            s_tm1: jnp.ndarray,
+    ) -> ITDNetworkOutput:
+        psiphi_network_output = self._network.apply(params, s_tm1)
+        return ITDNetworkOutput(
+            cumulants=psiphi_network_output.cumulants,
+            successor_features=psiphi_network_output.others_successor_features,
+            preference_vectors=psiphi_network_output.others_preference_vectors,
+            reward=psiphi_network_output.others_rewards,
+            policy_params=psiphi_network_output.others_policy_params)
+    
+    dqn_loss_fn = losses.DQNLoss(
+        network_fn=dqn_network_fn, gamma=self._cfg.gamma)
+    reward_loss_fn = losses.RewardLoss(network_fn=reward_network_fn)
+
+    bc_loss_fns = {
+        'bc_demo_{}'.format(n):
+        losses.BCLoss(network_fn=lambda p, s, n=n: bc_network_fn(p, s, n))
+        for n in range(self._cfg.num_demonstrators)
+    }
+    itd_loss_fns = {
+        'itd_demo_{}'.format(n): losses.ITDLoss(
+            network_fn=itd_network_fn,
+            demonstrator_index=n,
+            gamma=self._cfg.gamma,
+            l1_loss_coef=0.0) for n in range(self._cfg.num_demonstrators)
+    }
+
+    ego_transition, *others_transitions=transitions
+
+    dqn_loss_outputs = {
+        'dqn': dqn_loss_fn(params, target_params, ego_transition)
+    }
+    reward_loss_output = {'reward': reward_loss_fn(params, ego_transition)}
+    bc_loss_outputs = dict()
+    for (label, bc_loss_fn), transitions in zip(
+        bc_loss_fns.items(),
+        others_transitions,
+    ):
+        bc_loss_outputs[label] = bc_loss_fn(params, transitions)
+        itd_loss_outputs = dict()
+        for (label, itd_loss_fn), transitions in zip(
+            itd_loss_fns.items(),
+            others_transitions,
+        ): 
+            itd_loss_outputs[label] = itd_loss_fn(params, transitions)
+            
+            loss_output = tree_utils.merge_loss_outputs(
+                **dqn_loss_outputs, **reward_loss_output, **bc_loss_outputs,
+                **itd_loss_outputs)
+            
+            return loss_output
+        
+        def gpi_policy(psiphi_network_output: PsiPhiNetworkOutput) -> jnp.ndarray:
+
+            successor_features = jnp.concatenate(
+                [
+                    psiphi_network_output.ego_successor_features[:, None],
+                    psiphi_network_output.others_successor_features
+                ],
+                axis=1)
+            
+            ego_tast_energies = jnp.einsum(
+                'c, bnca->bna', psiphi_network_output.ego_preference_vector,
+                successor_features)
+            
+            ego_tast_preferences = jnp.max(ego_tast_energies, axis=-2)
+
+            return ego_tast_preferences
