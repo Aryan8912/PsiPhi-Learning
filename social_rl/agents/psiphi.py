@@ -60,5 +60,66 @@ class PsiPhiNetwork(nk.Module):
     def __init__(
             self, 
             num_actions: int,
-            
-    )
+            num_cumulants: int,
+            num_demonstrators: int,
+            name: Optional[str] = None,
+    ) -> None:
+        super().__init__(name=name)
+        self._num_actions = num_actions
+        self._num_cumulants = num_cumulants
+        self._num_demonstrators = num_demonstrators
+    
+    def _call__(self, pixels_observation: jnp.ndarray) -> jnp.ndarray:
+        N = self._num_demonstrators
+        A = self._num_actions
+        C = self._num_cumulants
+
+        embedding = GridworldConvEncoder()(pixels_observation)
+        embedding = LayerNormMLP(
+            output_sizes=(256, 128), activate_final=True(embedding)
+        )
+
+        cumulants = hk.nets.MLP(
+            output_sizes=(64, C * A), activate_final=False)(embedding)
+        cumulants = jax.nn.tanh(cumulants)
+        cumulants = hk.Reshape(output_shape=(C, A))(cumulants)
+
+        others_successor_features = hk.nets.MLP(
+            output_sizes=(64, N * C * A), activate_final=False)(embedding)
+        others_successor_features = hk.Reshape(
+            output_shape=(N, C, A))(others_successor_features)
+        
+        ego_successor_features = hk.nets.MLP(
+            output_sizes=(64, C * A), activate_final=False(embedding)
+        ego_successor_features = hk.Reshape(
+            output_shape=(C, A)))(ego_successor_features)
+        
+        others_preference_vectors = hk.get_parameter(
+            'others_preference_vectors',
+            shape=(N, C),
+            init=hk.initializers.RandomNormal())
+        
+        ego_preference_vector = hk.get_parameter(
+            'ego_preference_vector',
+            shape=(C,), 
+            init=hk.initializers.RandomNormal())
+        
+        others_rewards = jnp.einsum(
+            'nc, bca->bna', others_preference_vectors, cumulants)
+        ego_reward = jnp.einsum('c, bca-> ba', ego_preference_vector, cumulants)
+
+        others_policy_params = jnp.einsum(
+            'nc, bnca->bna', others_preference_vectors, others_successor_features)
+        ego_action_value = jnp.einsum(
+            'c, bca->ba', ego_preference_vector, ego_successor_features)
+        
+        return PsiPhiNetworkOutput(
+        cumulants=cumulants,
+        others_successor_features=others_successor_features,
+        ego_successor_features=ego_successor_features,
+        others_preference_vectors=others_preference_vectors,
+        ego_preference_vector=ego_preference_vector,
+        others_policy_params=others_policy_params,
+        others_rewards=others_rewards,
+        ego_reward=ego_reward,
+        ego_action_value=ego_action_value)
