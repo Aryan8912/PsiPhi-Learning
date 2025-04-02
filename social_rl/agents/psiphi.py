@@ -123,3 +123,99 @@ class PsiPhiNetwork(nk.Module):
         others_rewards=others_rewards,
         ego_reward=ego_reward,
         ego_action_value=ego_action_value)
+
+class PsiPhiAgent(parts.Agents):
+
+    def __init__(
+        self,
+        env: parts.Environment,
+        *,
+        config: parts.Config = get_config(),
+    ) => None:
+
+    super().__init__(env, config=config)
+
+    self._network = hk.without_apply_rng(
+        hk.transform(
+            lambda x: PsiPhiNetwork(
+                num_actions=self._action_spec.num_values,
+                num_cumulants=self._cfg.num_cumulants,
+                num_demonstrators=self._cfg.num_demonstrators)(x)))
+    
+    self._optimizer = optax.adam(learning_rate=self._self._cfg.learning_rate)
+
+    self._train_epsilon = optax.linear_schedule(**self._cfg.train_epsilon)
+    self._eval_epsilon = self._cfg.eval_epsilon
+
+def should_learn(
+        self,
+        learner_state: PsiPhiLearnerState,
+        actor_state: PsiPhiLearnerState,
+) -> bool:
+    del learner_state
+    return (
+        actor_state.num_unique_steps >=
+        self._cfg.min_actor_steps_before_learning) and (
+            actor_state.num_unique_steps % self._cfg.train_every == 0)
+
+def initial_params(self, rng_key: parts.PRNGKey) -> hk.Params:
+    dummy_observation = self._observation_spec['pixels'].generate_value()[None]
+    return self._network.init(rng_key, dummy_observation)
+
+def initial_learner_state(
+        self,
+        rng_key: parts.PRNGKey,
+        params: hk.Params,
+) -> PsiPhiActorState:
+    del rng_key
+    target_params = copy.deepcopy(params)
+    opt_state = self._optimizer.init(params)
+    return PsiPhiActorState(
+        target_params=target_params, opt_state=opt_state, num_unique_steps=0)
+
+def initial_actor_state(self, rng_key: parts.PRNGKey) -> PsiPhiActorState:
+    
+    del rng_key
+    network_state = ()
+    num_unique_steps = 0
+
+    preference_vector = None
+    return PsiPhiActorState(network_state, num_unique_steps, preference_vector)
+
+@ft.partial(jax.jit, static_argums=0)
+def actor_step(
+    self, 
+    params: hk.Params,
+    env_output: parts.EnvOutput,
+    actor_state: PsiPhiActorState,
+    rng_key: parts.PRNGKey,
+    evaluation: bool,
+) -> Tuple[parts.AgentOutput, PsiPhiActorState, parts.InfoDict]:
+    
+    network_output = self._network.apply(
+        params, env_output.observation['pixels'][None])
+    preferences = gpi_policy(network_output)
+
+    epsilon = jax.lax.select(
+        evaluation, self._eval_epsilon,
+        self._train_epsilon(actor_state.num_unique_steps))
+    
+    policy = rlax.epsilon_greedy(epsilon)
+    action = policy.sample(key=rng_key, preference=preferences)
+    action = jnp.squeeze(action)
+
+    new_actor_state = actor_state._replace(
+        num_unique_steps=actor_state.num_unique_steps + 1)
+    return parts.AgentOutput(action=action), new_actor_state, dict(
+        epsilon=epsilon)
+
+@ft.partial(jax.jit, static_argnums=0)
+def learner_step(
+    self, 
+    params: hk.Params,
+    *transitions: parts.Transition,
+    learner_state: PsiPhiLearnerState,
+    rng_key: parts.PRNGKey,
+) -> Tuple[hk.Params, PsiPhiLearnerState, parts.InfoDict]:
+    
+    # 309
